@@ -137,10 +137,18 @@ class ASET(Method):
         self.provides = {"system", "mos", "mo_space"}
 
     def __call__(self, parent_method):
-        assert isinstance(
+        provides = getattr(parent_method, "provides", set())
+        ok = isinstance(
             parent_method,
             (ActiveSpaceDriver, forte2.scf.RHF, forte2.scf.ROHF),
-        ), f"Parent method must be MCOptimizer, CI, RHF, or ROHF, got {type(parent_method)}"
+        ) or (
+            isinstance(parent_method, Method)
+            and {"system", "mos", "mo_space"}.issubset(provides)
+        )
+        assert ok, (
+            "Parent method must be MCOptimizer, CI, RHF, ROHF, or a Method providing "
+            f"{{'system', 'mos', 'mo_space'}}, got {type(parent_method)}"
+        )
         self._register_parent_method(parent_method)
         return self
 
@@ -169,6 +177,27 @@ class ASET(Method):
                 active_orbitals=list(range(nd, nd + ns)),
             )
             self._g1 = np.eye(ns)
+        else:
+            # General Method providing mo_space (e.g., AVAS, UNO, PySCFAdapter)
+            self.mo_space = self.parent_method.mo_space
+            nactv = self.mo_space.nactv
+            if nactv == 0:
+                self._g1 = np.zeros((0, 0))
+            elif getattr(self.parent_method, "g1_act", None) is not None:
+                self._g1 = np.asarray(self.parent_method.g1_act, dtype=float)
+            else:
+                nel = getattr(self.parent_method, "nel", None)
+                if nel is None:
+                    # Walk parent chain for total electron count, else neutral Zsum
+                    cur = getattr(self.parent_method, "parent_method", None)
+                    while cur is not None and nel is None:
+                        nel = getattr(cur, "nel", None)
+                        cur = getattr(cur, "parent_method", None)
+                if nel is None:
+                    nel = int(round(self.system.Zsum))
+                n_act_e = nel - 2 * len(self.mo_space.docc_indices)
+                occ_avg = max(0.0, min(2.0, n_act_e / nactv))
+                self._g1 = occ_avg * np.eye(nactv)
         self.mo_space = self.mo_space.update_frozen_orbitals(
             self.frozen_core_orbitals, self.frozen_virtual_orbitals
         )

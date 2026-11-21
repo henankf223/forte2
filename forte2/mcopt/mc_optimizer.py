@@ -186,16 +186,41 @@ class MCOptimizerBase(ActiveSpaceDriver, Method):
         #       (this is typically done iteratively with micro-iterations using L-BFGS)
         #     2. minimize energy wrt CI expansion at current orbitals
         #       (this is just the diagonalization of the active-space CI Hamiltonian)
+        # Cache the frozen-core effective one-electron operator and energy once
+        # and run OrbOptimizer strictly on the correlated orbital block (corr),
+        # turning frozen-space / Fragment-CASSCF from O(N^4) into O(N_corr^3 N_aux).
+        corr = self.mo_space.corr
+        if self.mo_space.nfrozen_core > 0:
+            C_frz = self._C[:, self.mo_space.frozen_core]
+            Hcore_eff = fock_builder.build_core_fock(C_frz, hcore=self.Hcore)
+            core_factor = 0.5 if self.system.two_component else 1.0
+            e_frz = core_factor * np.trace(
+                OrbOptimizer._transform_ao_operator(self.Hcore + Hcore_eff, C_frz)
+            )
+        else:
+            Hcore_eff = self.Hcore
+            e_frz = 0.0
+
+        nc = self.mo_space.ncore
+        na = self.mo_space.nactv
+        nv = self.mo_space.nvirt
+        core_local = slice(0, nc)
+        actv_local = slice(nc, nc + na)
+        virt_local = slice(nc + na, nc + na + nv)
+        C_corr = self._C[:, corr].copy()
+        nrr_corr = self.nrr[corr, corr]
+
         _OrbOptimizer = RelOrbOptimizer if self.system.two_component else OrbOptimizer
         self.orb_opt = _OrbOptimizer(
-            self._C,
-            (self.core, self.actv, self.virt),
+            C_corr,
+            (core_local, actv_local, virt_local),
             fock_builder,
-            self.Hcore,
+            Hcore_eff,
             self.system.nuclear_repulsion,
-            self.nrr,
+            nrr_corr,
             compute_active_hessian=self.mo_space.ngas > 1
             and not self.freeze_inter_gas_rots,
+            e_frozen=e_frz,
         )
 
         # Initialize the LBFGS solver that finds the optimal orbital
@@ -264,7 +289,7 @@ class MCOptimizerBase(ActiveSpaceDriver, Method):
             while self.iter < self.maxiter:
                 # 1. Optimize orbitals at fixed CI expansion
                 self.E_orb = self.lbfgs_solver.minimize(self.orb_opt, R)
-                self._C = self.orb_opt.C.copy()
+                self._C[:, corr] = self.orb_opt.C
                 # 2. Convergence checks
                 _dg = self.lbfgs_solver.g - self.g_old
                 self.dg_rms = np.sqrt(np.mean((_dg.conj() * _dg).real))
@@ -292,7 +317,7 @@ class MCOptimizerBase(ActiveSpaceDriver, Method):
                 # 3. Optimize CI expansion at fixed orbitals
                 self.ci_solver.set_ints(
                     self.orb_opt.Ecore + self.system.nuclear_repulsion,
-                    self.orb_opt.Fcore[self.actv, self.actv],
+                    self.orb_opt.Fcore[actv_local, actv_local],
                     self.orb_opt.get_active_space_ints(),
                 )
                 self.ci_solver.run()
@@ -315,7 +340,7 @@ class MCOptimizerBase(ActiveSpaceDriver, Method):
                     )
         self.ci_solver.set_ints(
             self.orb_opt.Ecore + self.system.nuclear_repulsion,
-            self.orb_opt.Fcore[self.actv, self.actv],
+            self.orb_opt.Fcore[actv_local, actv_local],
             self.orb_opt.get_active_space_ints(),
         )
 

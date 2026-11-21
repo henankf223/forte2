@@ -14,6 +14,7 @@ class OrbOptimizer:
         e_nuc: float,
         nrr: np.ndarray,
         compute_active_hessian: bool = False,
+        e_frozen: float = 0.0,
     ):
         self.core, self.actv, self.virt = extents
         self.C = C
@@ -21,20 +22,22 @@ class OrbOptimizer:
         self.Cgen = C
         self.Cact = C[:, self.actv]
         self.Ccore = C[:, self.core]
+        self.nmo = self.C.shape[1]
         self.ncore = self.Ccore.shape[1]
         self.nact = self.Cact.shape[1]
-        self.nvirt = self.C.shape[1] - self.ncore - self.nact
+        self.nvirt = self.nmo - self.ncore - self.nact
         self.fock_builder = fock_builder
         self.hcore = hcore
         self.nrr = nrr
         self.nrot = self.nrr.sum()
         self.e_nuc = e_nuc
+        self.e_frozen = float(np.real(e_frozen))
         self.compute_active_hessian = compute_active_hessian
 
         # the skew-hermitian rotation matrix, C_current = C_0 @ exp(R)
         self.R = np.zeros(self.nrot, dtype=float)
         # the unitary transformation matrix, U = exp(R)
-        self.U = np.eye(self.C.shape[1], dtype=float)
+        self.U = np.eye(self.nmo, dtype=float)
 
     def get_eri_gaaa(self):
         self.eri_gaaa = self.fock_builder.two_electron_integrals_gen_block(
@@ -123,7 +126,7 @@ class OrbOptimizer:
         return eM
 
     def _vec_to_mat(self, x):
-        R = np.zeros_like(self.C)
+        R = np.zeros((self.nmo, self.nmo), dtype=self.U.dtype)
         R[self.nrr] = x
         R += -R.T.conj()
         return R
@@ -148,17 +151,25 @@ class OrbOptimizer:
         )
 
     def _compute_Fcore(self):
-        # Compute the core Fock matrix [eq (3)], also return the core energy
-        Fcore_ao = self.fock_builder.build_core_fock(self.Ccore, hcore=self.hcore)
-        self.Fcore = self._transform_ao_operator(Fcore_ao, self.Cgen)
-
-        core_factor = 0.5 if self.fock_builder.system.two_component else 1.0
-        self.Ecore = core_factor * np.trace(
-            self._transform_ao_operator(
-                self.hcore + Fcore_ao,
-                self.Ccore,
+        # Compute the core Fock matrix [eq (3)], also return the core energy.
+        # When frozen core orbitals are cached in self.hcore = F_frz_ao and
+        # self.e_frozen = E_frz, this evaluates only the correlated core J/K:
+        #   Fcore_ao = F_frz_ao + V(D_core_corr)
+        #   Ecore    = E_frz + core_factor * Tr[(F_frz_ao + Fcore_ao) D_core_corr]
+        if self.ncore > 0:
+            Fcore_ao = self.fock_builder.build_core_fock(self.Ccore, hcore=self.hcore)
+            core_factor = 0.5 if self.fock_builder.system.two_component else 1.0
+            e_core_corr = core_factor * np.trace(
+                self._transform_ao_operator(
+                    self.hcore + Fcore_ao,
+                    self.Ccore,
+                )
             )
-        )
+            self.Ecore = self.e_frozen + e_core_corr
+        else:
+            Fcore_ao = self.hcore
+            self.Ecore = self.e_frozen
+        self.Fcore = self._transform_ao_operator(Fcore_ao, self.Cgen)
 
     def _compute_Fact(self):
         # [eq (13)]
@@ -251,6 +262,7 @@ class RelOrbOptimizer(OrbOptimizer):
         e_nuc: float,
         nrr: np.ndarray,
         compute_active_hessian: bool = False,
+        e_frozen: float = 0.0,
     ):
         super().__init__(
             C,
@@ -260,6 +272,7 @@ class RelOrbOptimizer(OrbOptimizer):
             e_nuc,
             nrr,
             compute_active_hessian,
+            e_frozen=e_frozen,
         )
         self.R = self.R.astype(np.complex128)
         self.U = self.U.astype(np.complex128)
