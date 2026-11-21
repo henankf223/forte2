@@ -10,13 +10,14 @@ from forte2.helpers import logger
 from forte2.helpers.matrix_functions import block_diag_2x2, block_eigh
 from forte2.base_classes import ActiveSpaceDriver, Method
 from forte2.data import ATOM_SYMBOL_TO_Z
+from forte2.orbitals.iao import IAO
 from forte2.orbitals.semicanonicalizer import Semicanonicalizer
 from forte2.orbitals.final_orbitals import FinalOrbitals
 
 
 @dataclass
 class ASET(Method):
-    """
+    r"""
     Zeroth-order Active Space Embedding Theory (ASET(0)) method for paritioning and projecting molecules.
 
     Parameters
@@ -31,10 +32,33 @@ class ASET(Method):
         Method for choosing the embedding cutoff. Options include "threshold", "num_of_orbitals".
     cutoff : float, optional, default = 0.5
         Projector eigenvalue for simple threshold methods.
-    num_A_occ : int, optional, default=0
-        Number of occupied orbitals fixed to this value in fragment A when cutoff method is "num_of_orbitals".
-    num_A_vir : int, optional, default=0
-        Number of virtual orbitals fixed to this value in fragment A when cutoff method is "num_of_orbitals".
+    num_A_occ : int | None, optional, default=0
+        Number of occupied orbitals assigned to fragment A when ``cutoff_method`` is
+        ``"num_of_orbitals"``. If ``None``, occupied orbitals fall back to ``cutoff_occ``
+        (or ``cutoff``).
+    num_A_vir : int | None, optional, default=0
+        Number of virtual orbitals assigned to fragment A when ``cutoff_method`` is
+        ``"num_of_orbitals"``. If ``None``, virtual orbitals fall back to ``cutoff``.
+    occ_projector : {"ao", "iao"}, optional, default="ao"
+        Projector used to localize and partition the inactive occupied (core) orbitals.
+        ``"ao"`` uses the raw atomic-orbital projector :math:`S S_A^{-1} S`; ``"iao"``
+        uses the polarized minimal-basis Intrinsic Atomic Orbital (IAO) projector
+        :math:`\sum_{p \in A} |\rho_p\rangle\langle\rho_p|`.
+    occ_cutoff_method : {"threshold", "num_of_orbitals", "bond_bath"} | None, optional, default=None
+        Cutoff strategy for the occupied (core) space. If ``None``, inherits
+        ``cutoff_method``. ``"bond_bath"`` places the occupied partition at the largest
+        log-ratio spectral gap above ``bond_bath_floor``, keeping severed covalent bond
+        orbitals intact inside fragment A.
+    cutoff_occ : float | None, optional, default=None
+        Threshold used for occupied orbital partitioning when ``occ_cutoff_method`` is
+        ``"threshold"`` (or ``num_A_occ is None``). If ``None``, inherits ``cutoff``.
+    bond_bath_floor : float, optional, default=0.10
+        Minimum projector eigenvalue eligible on the fragment side of the log-ratio
+        spectral gap when ``occ_cutoff_method == "bond_bath"``.
+    iao_include_active : bool, optional, default=True
+        When ``occ_projector == "iao"`` and the parent has active orbitals, include
+        valence-projected active orbitals alongside core orbitals when constructing
+        polarized IAOs.
 
     Notes
     -----
@@ -64,6 +88,11 @@ class ASET(Method):
     cutoff: float = 0.5
     num_A_occ: int | None = 0
     num_A_vir: int | None = 0
+    occ_projector: str = "ao"
+    occ_cutoff_method: str | None = None
+    cutoff_occ: float | None = None
+    bond_bath_floor: float = 0.10
+    iao_include_active: bool = True
 
     executed: bool = field(default=False, init=False)
     final_orbitals: FinalOrbitals = field(default="semicanonical", init=False)
@@ -134,12 +163,12 @@ class ASET(Method):
         )
         self.fragment_atoms = self._parse_fragment(self.fragment)
         self.P_ao_frag = self._make_fragment_projector()
-        self.executed = True
         self.partition = self._make_embedding()
         self._print_embedding_info(**self.partition)
         logger.log_info1("\nMO space is updated.")
         self._update_mo_space_from_partition()
         logger.log_info1("\nASET procedure completed.")
+        self.executed = True
 
         return self
 
@@ -149,19 +178,56 @@ class ASET(Method):
             "threshold",
             "num_of_orbitals",
         ], f"Invalid cutoff method: {self.cutoff_method}"
+        self.occ_projector = self.occ_projector.lower()
+        assert self.occ_projector in [
+            "ao",
+            "iao",
+        ], f"Invalid occ_projector: {self.occ_projector}"
+        occ_method = (
+            self.cutoff_method
+            if self.occ_cutoff_method is None
+            else self.occ_cutoff_method.lower()
+        )
+        assert occ_method in [
+            "threshold",
+            "num_of_orbitals",
+            "bond_bath",
+        ], f"Invalid occ_cutoff_method: {occ_method}"
+        self._occ_cutoff_method = occ_method
+        occ_cut = self.cutoff if self.cutoff_occ is None else self.cutoff_occ
+        self._cutoff_occ = occ_cut
+
         if self.cutoff_method == "threshold":
             assert (
                 self.cutoff > 0 and self.cutoff < 1
-            ), f"threshold must be in [0, 1], got {self.cutoff}"
+            ), f"threshold must be in (0, 1), got {self.cutoff}"
         elif self.cutoff_method == "num_of_orbitals":
-            if self.num_A_occ is not None:
+            if self.num_A_vir is None:
                 assert (
-                    self.num_A_occ >= 0
-                ), f"Number of occupied orbitals in Fragment A must be non-negative, got {self.num_A_occ}"
+                    self.cutoff > 0 and self.cutoff < 1
+                ), f"threshold must be in (0, 1), got {self.cutoff}"
             if self.num_A_vir is not None:
                 assert (
                     self.num_A_vir >= 0
                 ), f"Number of virtual orbitals in Fragment A must be non-negative, got {self.num_A_vir}"
+
+        if occ_method == "threshold":
+            assert (
+                0 < occ_cut < 1
+            ), f"occupied threshold must be in (0, 1), got {occ_cut}"
+        elif occ_method == "num_of_orbitals":
+            if self.num_A_occ is None:
+                assert (
+                    0 < occ_cut < 1
+                ), f"occupied threshold must be in (0, 1), got {occ_cut}"
+            else:
+                assert (
+                    self.num_A_occ >= 0
+                ), f"Number of occupied orbitals in Fragment A must be non-negative, got {self.num_A_occ}"
+        elif occ_method == "bond_bath":
+            assert (
+                0 < self.bond_bath_floor < 1
+            ), f"bond_bath_floor must be in (0, 1), got {self.bond_bath_floor}"
 
     def _parse_fragment(self, frag_str: str | list[str]) -> list[int]:
         """
@@ -293,6 +359,126 @@ class ASET(Method):
 
         return P_ao_frag
 
+    def _make_iao_fragment_projector(self, C_contig: np.ndarray) -> np.ndarray:
+        """
+        Build the polarized minimal-basis IAO fragment projector in the AO basis:
+
+            P^{A,IAO}_{AO} = S_1 C_{iao, A} C_{iao, A}^T S_1,
+
+        where C_{iao, A} collects the symmetrically orthonormalized IAOs centered
+        on fragment atoms.
+        """
+        if self.two_component:
+            raise NotImplementedError(
+                "occ_projector='iao' is not yet supported for two-component parents."
+            )
+        if self.system.minao_basis is None:
+            raise ValueError(
+                "occ_projector='iao' requires system.minao_basis to be initialized."
+            )
+
+        # Reference orbitals used to polarize the IAOs: all doubly occupied orbitals,
+        # optionally augmented with valence-projected active orbitals.
+        C_docc = C_contig[:, self.mo_space.docc]
+        C_ref = C_docc
+        if self.iao_include_active and self.nactv > 0:
+            C_act = C_contig[:, self.mo_space.actv]
+            S12 = ints.overlap(self.system.basis, self.system.minao_basis)
+            S2 = ints.overlap(self.system.minao_basis, self.system.minao_basis)
+            S2_inv = np.linalg.pinv(S2, hermitian=True)
+            P21_act = S2_inv @ (S12.T @ C_act)
+            val_norms = np.einsum("pi,pq,qi->i", P21_act, S2, P21_act)
+            max_extra = max(0, self.system.minao_basis.size - C_docc.shape[1])
+            keep = [i for i in np.argsort(val_norms)[::-1] if val_norms[i] > 0.5][
+                :max_extra
+            ]
+            if keep:
+                C_ref = np.hstack([C_docc, C_act[:, sorted(keep)]])
+
+        iao = IAO(self.system, C_ref)
+        self.iao = iao
+
+        cfl = self.system.minao_basis.center_first_and_last
+        frag_iao_indices = sorted(
+            p for atom_idx in self.fragment_atoms for p in range(*cfl[atom_idx])
+        )
+        C_iao_A = iao.C_iao[:, frag_iao_indices]
+        SC_A = iao.S1 @ C_iao_A
+        P_iao_ao = SC_A @ SC_A.T.conj()
+        return P_iao_ao
+
+    @staticmethod
+    def _select_bond_bath(
+        occ_pairs: list[tuple[int, float]],
+        floor: float = 0.10,
+    ) -> tuple[list[int], list[int], float]:
+        """
+        Partition descending-sorted occupied ``(mo_idx, lambda)`` pairs at the
+        largest log-ratio spectral gap ``log(lam_k / lam_{k+1})`` with
+        ``lam_k >= floor``, retaining all severed covalent bond orbitals in A.
+        """
+        if not occ_pairs:
+            return [], [], 0.0
+        vals = [v for _, v in occ_pairs]
+        if vals[0] < floor:
+            return [], [i for i, _ in occ_pairs], 0.0
+        if vals[-1] >= floor:
+            return [i for i, _ in occ_pairs], [], 0.0
+
+        eps = 1e-12
+        best_k = 0
+        best_gap = -1.0
+        for k in range(len(vals) - 1):
+            if vals[k] < floor:
+                break
+            gap = float(np.log(max(vals[k], eps) / max(vals[k + 1], eps)))
+            if gap > best_gap:
+                best_gap = gap
+                best_k = k
+
+        index_A_occ = [i for i, _ in occ_pairs[: best_k + 1]]
+        index_B_occ = [i for i, _ in occ_pairs[best_k + 1 :]]
+        return index_A_occ, index_B_occ, best_gap
+
+    @staticmethod
+    def _canonicalize_projector_nullspace(
+        vals: np.ndarray,
+        U: np.ndarray,
+        h: np.ndarray,
+        C_block: np.ndarray,
+        F_ao: np.ndarray,
+        tol: float,
+        ascending: bool,
+        null_tol: float = 1e-10,
+    ) -> tuple[np.ndarray, np.ndarray, list[int]]:
+        """
+        Canonicalize the degenerate zero-eigenvalue null space of a projector block
+        using the generalized Fock matrix.
+
+        Returns the updated rotation matrix ``U``, irrep array ``h``, and priority
+        index list (non-null orbitals ordered by descending projector eigenvalue,
+        followed by null-space orbitals ordered by Fock energy).
+        """
+        nonnull_pos = [k for k, v in enumerate(vals) if v >= null_tol]
+        null_pos = [k for k, v in enumerate(vals) if v < null_tol]
+        nonnull_pos.sort(key=lambda k: vals[k], reverse=True)
+        if not null_pos:
+            return U, h, nonnull_pos
+
+        C_null = C_block @ U[:, null_pos]
+        F_null = C_null.conj().T @ F_ao @ C_null
+        h_null = h[null_pos]
+        f_vals, U_f, h_f = block_eigh(F_null, h_null, atol=0.0, rtol=tol, sort=True)
+        if not ascending:
+            U_f = U_f[:, ::-1]
+            h_f = h_f[::-1]
+
+        U_out = U.copy()
+        h_out = h.copy()
+        U_out[:, null_pos] = U_out[:, null_pos] @ U_f
+        h_out[null_pos] = h_f
+        return U_out, h_out, nonnull_pos + null_pos
+
     def _make_embedding(self):
         """
         Perform Orbital Partitioning for ASET.
@@ -302,20 +488,25 @@ class ASET(Method):
         # Sort the orbitals into contiguous core, active, virtual blocks
         C_contig = C[:, self.mo_space.orig_to_contig]
 
-        # Build the fragment projector
+        # Build the fragment projector(s)
         P_ao_frag = self.P_ao_frag
-        P_frag = C_contig.conj().T @ P_ao_frag @ C_contig
+        if self.occ_projector == "iao":
+            P_ao_occ = self._make_iao_fragment_projector(C_contig)
+        else:
+            P_ao_occ = P_ao_frag
+        self.P_ao_occ = P_ao_occ
 
-        # 6) Split P_frag into occupied and virtual blocks
+        # 6) Split projected matrices into occupied and virtual blocks
         core = self.mo_space.core
         core_inds = self.mo_space.core_indices
         active_orbitals = [list(active) for active in self.mo_space.active_orbitals]
         virt = self.mo_space.virt
         virt_inds = self.mo_space.virtual_indices
 
-        # Split P_frag into occupied and virtual blocks
-        P_frag_oo = P_frag[core, core]
-        P_frag_vv = P_frag[virt, virt]
+        C_core = C_contig[:, core]
+        C_virt = C_contig[:, virt]
+        P_frag_oo = C_core.conj().T @ P_ao_occ @ C_core
+        P_frag_vv = C_virt.conj().T @ P_ao_frag @ C_virt
 
         # irrep of each MO; all rotations below stay within irreps
         irreps = np.array(self.mos.irrep_indices[0])
@@ -337,31 +528,80 @@ class ASET(Method):
         # resort the virtual eigenvalue/eigenvector pairs, and their irreps with them
         lv_vals = lv_vals[::-1]
         Uv = Uv[:, ::-1]
-        irreps[core_inds] = h_o
-        irreps[virt_inds] = h_v[::-1]
+        h_v = h_v[::-1]
 
-        # Sort the eigenvalue/eigenvector pairs by eigenvalue in descending order
-        occ_pairs = sorted(zip(core_inds, lo_vals), key=lambda x: x[1], reverse=True)
-        vir_pairs = sorted(zip(virt_inds, lv_vals), key=lambda x: x[1], reverse=True)
+        # When num_of_orbitals requests more fragment orbitals than the numerical
+        # rank of the fragment projector, canonicalize the degenerate zero-eigenvalue
+        # null space with the generalized Fock matrix so the A/B cut is deterministic
+        # and minimizes off-diagonal F_{A,B} couplings (crucial for smooth ASET(2) PESs).
+        null_tol = 1e-10
+        need_occ_null = (
+            self._occ_cutoff_method == "num_of_orbitals"
+            and self.num_A_occ is not None
+            and self.num_A_occ > int(np.sum(lo_vals >= null_tol))
+            and np.any(lo_vals < null_tol)
+        )
+        need_vir_null = (
+            self.cutoff_method == "num_of_orbitals"
+            and self.num_A_vir is not None
+            and self.num_A_vir > int(np.sum(lv_vals >= null_tol))
+            and np.any(lv_vals < null_tol)
+        )
+        occ_order = sorted(range(len(core_inds)), key=lambda k: lo_vals[k], reverse=True)
+        vir_order = sorted(range(len(virt_inds)), key=lambda k: lv_vals[k], reverse=True)
+        if need_occ_null or need_vir_null:
+            F_ao = self.system.fock_builder.build_generalized_fock(
+                C_core=C_contig[:, self.mo_space.docc],
+                C_act=C_contig[:, self.mo_space.actv],
+                g1=self._g1,
+            )
+            if need_occ_null:
+                Uo, h_o, occ_order = self._canonicalize_projector_nullspace(
+                    lo_vals,
+                    Uo,
+                    h_o,
+                    C[:, core_inds],
+                    F_ao,
+                    tol=tol,
+                    ascending=False,
+                    null_tol=null_tol,
+                )
+            if need_vir_null:
+                Uv, h_v, vir_order = self._canonicalize_projector_nullspace(
+                    lv_vals,
+                    Uv,
+                    h_v,
+                    C[:, virt_inds],
+                    F_ao,
+                    tol=tol,
+                    ascending=True,
+                    null_tol=null_tol,
+                )
+
+        irreps[core_inds] = h_o
+        irreps[virt_inds] = h_v
+
+        # Ordered (global_mo_idx, projector_eigenvalue) lists
+        occ_pairs = [(core_inds[k], lo_vals[k]) for k in occ_order]
+        vir_pairs = [(virt_inds[k], lv_vals[k]) for k in vir_order]
 
         # Apply the unitary transformations to the occupied and virtual blocks of C
         C[:, core_inds] = C[:, core_inds] @ Uo
         C[:, virt_inds] = C[:, virt_inds] @ Uv
 
-        # Partition by cutoff
+        # Partition occupied orbitals
         index_A_occ, index_B_occ = [], []
-        index_A_vir, index_B_vir = [], []
-        if self.cutoff_method == "threshold":
-            # Select orbitals with eigenvalues above the threshold
+        if self._occ_cutoff_method == "threshold":
             for i, v in occ_pairs:
-                (index_A_occ if v > self.cutoff else index_B_occ).append(i)
-            for i, v in vir_pairs:
-                (index_A_vir if v > self.cutoff else index_B_vir).append(i)
-
-        elif self.cutoff_method == "num_of_orbitals":
+                (index_A_occ if v > self._cutoff_occ else index_B_occ).append(i)
+        elif self._occ_cutoff_method == "bond_bath":
+            index_A_occ, index_B_occ, self.bond_bath_gap = self._select_bond_bath(
+                occ_pairs, floor=self.bond_bath_floor
+            )
+        elif self._occ_cutoff_method == "num_of_orbitals":
             if self.num_A_occ is None:
                 for i, v in occ_pairs:
-                    (index_A_occ if v > self.cutoff else index_B_occ).append(i)
+                    (index_A_occ if v > self._cutoff_occ else index_B_occ).append(i)
             else:
                 for rank, (glob_i, v) in enumerate(occ_pairs):
                     if rank < self.num_A_occ:
@@ -374,6 +614,12 @@ class ASET(Method):
                                 "and is assigned to B."
                             )
 
+        # Partition virtual orbitals
+        index_A_vir, index_B_vir = [], []
+        if self.cutoff_method == "threshold":
+            for i, v in vir_pairs:
+                (index_A_vir if v > self.cutoff else index_B_vir).append(i)
+        elif self.cutoff_method == "num_of_orbitals":
             if self.num_A_vir is None:
                 for i, v in vir_pairs:
                     (index_A_vir if v > self.cutoff else index_B_vir).append(i)
