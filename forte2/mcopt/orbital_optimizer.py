@@ -4,6 +4,59 @@ import scipy as sp
 from forte2.jkbuilder import FockBuilder
 
 
+class _SubspaceDFFockBuilder:
+    """
+    Lightweight DF Fock & integral builder restricted to a fixed correlated
+    orbital subspace ``C0_corr`` of dimension ``n_corr << nbf``.
+
+    Transforms the 3-index DF tensor ``B^P_{pq}`` once at initialization so that
+    every micro-iteration of frozen-space / Fragment-CASSCF costs strictly
+    O(n_corr^2 * n_occ * n_aux) instead of O(nbf^2 * n_occ * n_aux).
+    """
+
+    def __init__(self, fock_builder: FockBuilder, C0_corr: np.ndarray):
+        self.system = fock_builder.system
+        self.B_frag = np.ascontiguousarray(
+            fock_builder.B_tensor_gen_block(C0_corr, C0_corr)
+        )  # (naux, n_corr, n_corr)
+
+    def build_core_fock(self, U_core: np.ndarray, hcore: np.ndarray) -> np.ndarray:
+        if U_core.shape[1] == 0:
+            return hcore.copy()
+        D = U_core @ U_core.T
+        j_aux = np.einsum("Ppq,pq->P", self.B_frag, D, optimize=True)
+        J = np.einsum("P,Ppq->pq", j_aux, self.B_frag, optimize=True)
+        B_c = np.einsum("Ppq,qi->Ppi", self.B_frag, U_core, optimize=True)
+        K = np.einsum("Ppi,Pqi->pq", B_c, B_c, optimize=True)
+        return hcore + 2.0 * J - K
+
+    def build_active_fock(self, U_act: np.ndarray, g1: np.ndarray) -> np.ndarray:
+        if U_act.shape[1] == 0:
+            n = self.B_frag.shape[1]
+            return np.zeros((n, n), dtype=self.B_frag.dtype)
+        D_act = U_act @ g1 @ U_act.T
+        j_aux = np.einsum("Ppq,pq->P", self.B_frag, D_act, optimize=True)
+        J = np.einsum("P,Ppq->pq", j_aux, self.B_frag, optimize=True)
+        B_a = np.einsum("Ppq,qu->Ppu", self.B_frag, U_act, optimize=True)
+        B_ag = np.einsum("Ppu,uv->Ppv", B_a, g1, optimize=True)
+        K = np.einsum("Ppv,Pqv->pq", B_ag, B_a, optimize=True)
+        return J - 0.5 * K
+
+    def two_electron_integrals_gen_block(
+        self,
+        U1: np.ndarray,
+        U2: np.ndarray,
+        U3: np.ndarray,
+        U4: np.ndarray,
+    ) -> np.ndarray:
+        B13 = np.einsum("Ppq,pi,qk->Pik", self.B_frag, U1, U3, optimize=True)
+        if U2 is U1 and U4 is U3:
+            B24 = B13
+        else:
+            B24 = np.einsum("Ppq,pj,ql->Pjl", self.B_frag, U2, U4, optimize=True)
+        return np.einsum("Pik,Pjl->ijkl", B13, B24, optimize=True)
+
+
 class OrbOptimizer:
     def __init__(
         self,

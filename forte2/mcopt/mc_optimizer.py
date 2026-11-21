@@ -15,7 +15,7 @@ from forte2.helpers import logger, LBFGS
 from forte2.system.basis_utils import BasisInfo
 from forte2.system import ModelSystem
 from forte2.symmetry import real_sph_to_j_adapted
-from .orbital_optimizer import OrbOptimizer, RelOrbOptimizer
+from .orbital_optimizer import OrbOptimizer, RelOrbOptimizer, _SubspaceDFFockBuilder
 
 # Largest tolerated deviation of C^H S C from the identity. Valid orbitals stay
 # below ~1e-9 even in nearly linearly dependent bases.
@@ -207,21 +207,44 @@ class MCOptimizerBase(ActiveSpaceDriver, Method):
         core_local = slice(0, nc)
         actv_local = slice(nc, nc + na)
         virt_local = slice(nc + na, nc + na + nv)
-        C_corr = self._C[:, corr].copy()
+        C_corr0 = self._C[:, corr].copy()
         nrr_corr = self.nrr[corr, corr]
 
-        _OrbOptimizer = RelOrbOptimizer if self.system.two_component else OrbOptimizer
-        self.orb_opt = _OrbOptimizer(
-            C_corr,
-            (core_local, actv_local, virt_local),
-            fock_builder,
-            Hcore_eff,
-            self.system.nuclear_repulsion,
-            nrr_corr,
-            compute_active_hessian=self.mo_space.ngas > 1
-            and not self.freeze_inter_gas_rots,
-            e_frozen=e_frz,
+        use_subspace_df = (
+            C_corr0.shape[1] < self._C.shape[1]
+            and C_corr0.shape[1] > 0
+            and not self.system.two_component
+            and not getattr(fock_builder, "has_dense_tei", False)
+            and hasattr(fock_builder, "B_tensor_gen_block")
         )
+
+        _OrbOptimizer = RelOrbOptimizer if self.system.two_component else OrbOptimizer
+        if use_subspace_df:
+            sub_fb = _SubspaceDFFockBuilder(fock_builder, C_corr0)
+            h_frag = C_corr0.T @ Hcore_eff @ C_corr0
+            self.orb_opt = _OrbOptimizer(
+                np.eye(C_corr0.shape[1], dtype=self.dtype),
+                (core_local, actv_local, virt_local),
+                sub_fb,
+                h_frag,
+                self.system.nuclear_repulsion,
+                nrr_corr,
+                compute_active_hessian=self.mo_space.ngas > 1
+                and not self.freeze_inter_gas_rots,
+                e_frozen=e_frz,
+            )
+        else:
+            self.orb_opt = _OrbOptimizer(
+                C_corr0,
+                (core_local, actv_local, virt_local),
+                fock_builder,
+                Hcore_eff,
+                self.system.nuclear_repulsion,
+                nrr_corr,
+                compute_active_hessian=self.mo_space.ngas > 1
+                and not self.freeze_inter_gas_rots,
+                e_frozen=e_frz,
+            )
 
         # Initialize the LBFGS solver that finds the optimal orbital
         # at fixed CI expansion using the gradient and diagonal Hessian
@@ -289,7 +312,9 @@ class MCOptimizerBase(ActiveSpaceDriver, Method):
             while self.iter < self.maxiter:
                 # 1. Optimize orbitals at fixed CI expansion
                 self.E_orb = self.lbfgs_solver.minimize(self.orb_opt, R)
-                self._C[:, corr] = self.orb_opt.C
+                self._C[:, corr] = (
+                    C_corr0 @ self.orb_opt.C if use_subspace_df else self.orb_opt.C
+                )
                 # 2. Convergence checks
                 _dg = self.lbfgs_solver.g - self.g_old
                 self.dg_rms = np.sqrt(np.mean((_dg.conj() * _dg).real))
