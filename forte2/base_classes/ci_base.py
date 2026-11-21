@@ -228,6 +228,35 @@ class CIBase(ActiveSpaceSolver):
             dm1, dm2, dm3
         )
 
+    def make_average_cumulants(self, max_order: int = 3):
+        """
+        Make the state-averaged RDMs and cumulants in one pass, sharing the 1- and
+        2-RDM between them.
+        """
+        from forte2.ci.ci_utils import (
+            make_2cumulant_sf,
+            make_2cumulant_so,
+            make_3cumulant_sf,
+            make_3cumulant_so,
+        )
+
+        if max_order not in (2, 3):
+            raise ValueError(f"max_order must be one of (2, 3), got {max_order}.")
+
+        dm1 = self.make_average_rdm(1)
+        dm2 = self.make_average_rdm(2)
+        lambda2 = (make_2cumulant_so if self.two_component else make_2cumulant_sf)(
+            dm1, dm2
+        )
+        if max_order == 2:
+            return dm1, dm2, lambda2, None
+
+        dm3 = self.make_average_rdm(3)
+        lambda3 = (make_3cumulant_so if self.two_component else make_3cumulant_sf)(
+            dm1, dm2, dm3
+        )
+        return dm1, dm2, lambda2, lambda3
+
     def make_active_space_ints(self):
         """Build the active-space integrals for the current ``self.mos``."""
         return self._integrals_cls(

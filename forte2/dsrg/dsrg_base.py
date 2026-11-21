@@ -8,6 +8,11 @@ from forte2.base_classes import ActiveSpaceDriver, Method
 from forte2.helpers import logger
 from forte2.orbitals import Semicanonicalizer
 from forte2.ci.ci_utils import pretty_print_ci_summary
+from .dsrg_common import _DSRGHelper
+from .rel_dsrg_common import _RelDSRGHelper
+
+# Largest off-diagonal Fock element tolerated within an orbital block.
+_SEMICANONICAL_TOL = 1e-8
 
 
 @dataclass
@@ -25,23 +30,64 @@ class DSRGBase(Method):
     frozen_core_orbitals: int | list[int] = None
     frozen_virtual_orbitals: int | list[int] = None
 
+    # Build the active-space effective Hamiltonian even when the reference is not relaxed
+    save_hbar: bool = False
+
+    # Skip the three-body cumulant everywhere: the 3-RDM is never formed and lambda3
+    # is never transformed into the semicanonical basis. For DSRG-MRPT3 lambda3 only
+    # enters the energy, so the relaxed eigenvalues -- and hence any splitting -- are
+    # unchanged; E_dsrg loses one term. For MRPT2 it also drops a term from the
+    # virtual-virtual 1-RDM, so FNO natural orbitals (and anything downstream of them)
+    # do change. See _warn_skip_3_cumulant.
+    skip_3_cumulant: bool = False
+
     # Non-init attributes
+    _warned_skip_3c: bool = field(init=False, default=False)
     converged: bool = field(init=False, default=False)
     _hbar0: float | None = field(init=False, default=None)
     _hbar1_canon: NDArray | None = field(init=False, default=None)
     _hbar2_canon: NDArray | None = field(init=False, default=None)
+    # The DSRG energy before any incoming hbar_shift is applied
+    _E_dsrg_bare: float | None = field(init=False, default=None)
+    # Used for FNO corrections
+    hbar_shift: dict | None = field(init=False, default=None)
+
+    def _warn_skip_3_cumulant(self):
+        """Say once, at run time, what dropping the three-body cumulant costs."""
+        if not self.skip_3_cumulant or self._warned_skip_3c:
+            return
+        self._warned_skip_3c = True
+        logger.log_warning(
+            "  skip_3_cumulant is set: the three-body cumulant is not built. "
+            "E_dsrg omits its lambda3 term, and any virtual natural orbitals built "
+            "from the unrelaxed 1-RDM omit theirs. Relaxed eigenvalues of "
+            "DSRG-MRPT3 are unaffected."
+        )
 
     def __call__(self, parent_method):
         self._register_parent_method(parent_method)
-        assert isinstance(self.parent_method, ActiveSpaceDriver), (
+        assert isinstance(self.parent_method, (ActiveSpaceDriver, DSRGBase)), (
             "Parent method must be a driver that owns an active-space solver "
-            f"(CI or MCOptimizer), got {type(self.parent_method).__name__}."
+            "(CI or MCOptimizer), or another DSRG method, got "
+            f"{type(self.parent_method).__name__}."
         )
         return self
+
+    @property
+    def ci_solver(self):
+        """
+        The ci_solver of the parent method. A property (rather than a plain
+        attribute cached in _startup) so it is available immediately at
+        construction time, matching CIBase.ci_solver -- this lets a DSRGBase
+        object itself serve as a valid parent for another DSRG method before
+        it has necessarily been run.
+        """
+        return self.parent_method.ci_solver
 
     def __post_init__(self):
         self.requires = {"system", "mos", "mo_space"}
         self.provides = {"system", "mos", "mo_space"}
+        self.requires_attrs.update({"ci_solver": None})
 
         # parse reference relaxation options
         if isinstance(self.relax_reference, bool):
@@ -107,11 +153,17 @@ class DSRGBase(Method):
         self.hc = self.core
         self.pv = slice(self.nact, self.nact + self.nvirt)
 
-        self.mos = self.parent_method.mos.copy()
-        contig = self.mos.permute(self.mo_space.orig_to_contig)
-        self._C = contig.C[0]
+        self.dsrg_helper = (
+            _RelDSRGHelper(self) if self.two_component else _DSRGHelper(self)
+        )
+        perm = self.mo_space.orig_to_contig
+        self._C = self.mos.C[0][:, perm].copy()
 
-        self.ci_solver = self.parent_method.ci_solver
+        if self.nrelax > 0:
+            # The parent has had its say by now; every further run of this solver
+            # is a relaxation cycle, so keep those quiet.
+            self.ci_solver.log_level = logger.VERBOSITY_DEBUG
+
         self.E_core_orig = self.ci_solver.sub_solvers[0].ints.E
         self.H_orig = self.ci_solver.sub_solvers[0].ints.H.copy()
         self.V_orig = self.ci_solver.sub_solvers[0].ints.V.copy()
@@ -119,7 +171,9 @@ class DSRGBase(Method):
         self.semicanonicalizer = Semicanonicalizer(
             system=self.system,
             mo_space=self.mo_space,
-            irrep_indices=np.array(contig.irrep_indices[0]),
+            irrep_indices=np.array(self.mos.irrep_indices[0])[
+                self.mo_space.orig_to_contig
+            ],
             mix_active=False,
             # do not mix correlated core and frozen core orbitals after MCSCF
             mix_inactive=False,
@@ -127,16 +181,156 @@ class DSRGBase(Method):
 
         self.fock_builder = self.system.fock_builder
         self.ints, self.cumulants = self.get_integrals()
+        self._log_semicanonical_check()
+
+    @property
+    def _fock_actv_0th(self) -> NDArray:
+        """Active-active block of the DSRG zeroth-order Hamiltonian.
+
+        Only the diagonal, so H(0) holds exactly the Fock eigenvalues the
+        denominators use. With several GASes the coupling between them survives
+        semicanonicalization and is dropped here; that is a first-order term
+        whose contributions are neglected, following ref. [1], and it matches
+        forte's spin-integrated DSRG-MRPT2. A no-op for a single active space,
+        where the block is already diagonal.
+
+        Second order only. `_build_fock_0th_1st`, used at third order, keeps the
+        coupling instead -- see its docstring.
+        """
+        return np.diag(np.diag(self.fock[self.actv, self.actv]))
+
+    def _build_fock_0th_1st(self) -> tuple[NDArray, NDArray]:
+        """The zeroth- and first-order parts of the generalized Fock matrix.
+
+        Takes the whole active-active block into H(0), so with several GASes the
+        coupling between them is kept there and is absent from H(1). That is what
+        both of forte's MRPT3 codes do, and it is what reproduces their
+        spin-adapted energies. It differs from `_fock_actv_0th`, i.e. from second
+        order, which is unsatisfying but is the only third-order choice with an
+        external reference until the two-component MRPT3 discrepancy tracked in
+        tests/dsrg/test_rel_pt3_vs_nonrel.py is resolved.
+        """
+        fock_0th = np.zeros_like(self.fock)
+        fock_0th[self.core, self.core] = self.fock[self.core, self.core]
+        fock_0th[self.actv, self.actv] = self.fock[self.actv, self.actv]
+        fock_0th[self.virt, self.virt] = self.fock[self.virt, self.virt]
+        return fock_0th, self.fock - fock_0th
+
+    def _log_semicanonical_check(self):
+        """Log per-block off-diagonal Fock norms and the coupling between GASes.
+
+        The denominators use only the Fock diagonal, so an off-diagonal element
+        inside a block is an error; coupling between GASes is expected.
+        """
+        gas = self.mo_space.gas_corr
+        blocks = [("CORE", self.core)]
+        if len(gas) == 1:
+            blocks.append(("ACTIVE", gas[0]))
+        else:
+            blocks.extend((f"GAS{i + 1}", sl) for i, sl in enumerate(gas))
+        blocks.append(("VIRTUAL", self.virt))
+
+        width = 46
+        logger.log_info1("\n" + "=" * width)
+        logger.log_info1("DSRG Semicanonical Orbital Check".center(width))
+        logger.log_info1("=" * width)
+        logger.log_info1(f"{'Block':<10}{'#':>5}{'Max':>15}{'Mean':>16}")
+        logger.log_info1("-" * width)
+        worst = 0.0
+        for name, sl in blocks:
+            block = self.fock[sl, sl]
+            nblock = block.shape[0]
+            offdiag = np.abs(block - np.diag(np.diag(block)))
+            fmax = offdiag.max() if nblock > 1 else 0.0
+            fmean = offdiag.sum() / (nblock * (nblock - 1)) if nblock > 1 else 0.0
+            worst = max(worst, fmax)
+            logger.log_info1(f"{name:<10}{nblock:>5d}{fmax:>15.10f}{fmean:>16.10f}")
+        logger.log_info1("=" * width)
+
+        if worst > _SEMICANONICAL_TOL:
+            logger.log_warning(
+                f"  Fock matrix not diagonal within an orbital block (max "
+                f"{worst:.3e}); DSRG denominators use only its diagonal."
+            )
+
+        if len(gas) < 2:
+            return
+
+        # gas_corr slices index the correlated space, as self.fock does.
+        coupling = max(
+            np.abs(self.fock[a, b]).max()
+            for i, a in enumerate(gas)
+            for b in gas[i + 1 :]
+        )
+        logger.log_info1(
+            f"  Largest coupling between GASes: {coupling:.10f}\n"
+            "  GAS-to-GAS excitations are excluded from the DSRG amplitudes."
+        )
+
+        if self.two_component:
+            logger.log_warning(
+                "  Two-component DSRG omits the GAS-GAS Fock coupling from T1 and "
+                "F-tilde, which the spin-adapted solvers keep: expect ~1e-4 Eh "
+                "disagreement between them."
+            )
+
+    def _release_integrals(self):
+        """
+        Release large per-run integral/cumulant state once it is no longer
+        needed, freeing the underlying memory.
+        """
+        self.ints = None
+        self.cumulants = None
+
+    def _build_hbar(self):
+        """
+        Fold the raw hbar1/hbar2 left by solve_dsrg(form_hbar=True) into the
+        CI-ready effective Hamiltonian, storing it as _hbar0/_hbar1_canon/
+        _hbar2_canon (and applying any incoming hbar_shift).
+
+        Implementations must not consume hbar1/hbar2 in place, so that calling
+        this more than once per solve is harmless.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement _build_hbar, so it "
+            "cannot expose its effective Hamiltonian outside of reference "
+            "relaxation (save_hbar is not supported)."
+        )
+
+    def _solve_dsrg_shifted(self, form_hbar):
+        """
+        Solve, keeping the unshifted energy in _E_dsrg_bare and returning it
+        with any incoming hbar_shift's energy contribution applied.
+        """
+        e_dsrg = self.solve_dsrg(form_hbar)
+        # Two-component solvers return a complex energy whose imaginary part should
+        # be numerical noise. Check it before discarding it: casting first both
+        # warns and makes the diagnostic unreachable, since a float's .imag is 0.
+        if abs(np.imag(e_dsrg)) > 1e-12:
+            logger.log_warning(
+                f"DSRG energy has a significant imaginary component: {np.imag(e_dsrg)}"
+            )
+        self._E_dsrg_bare = float(np.real(e_dsrg))
+        if self.save_hbar:
+            self._build_hbar()
+        shift = getattr(self.parent_method, "hbar_shift", None)
+        if shift is None:
+            return self._E_dsrg_bare
+        return self._E_dsrg_bare + shift["e_dsrg"]
+
+    def _post_process(self):
+        """
+        Hook run at the end of run(), after the energy (and, if requested, the
+        effective Hamiltonian) is available. Subclasses override it to expose
+        derived quantities -- e.g. RelDSRG_MRPT2 uses it to truncate its
+        virtual space to frozen natural orbitals, and to publish an hbar_shift.
+        """
 
     def run(self):
         self._startup()
-        form_hbar = self.nrelax > 0
+        form_hbar = self.nrelax > 0 or self.save_hbar
 
-        self.E_dsrg = self.solve_dsrg(form_hbar)
-        if abs(self.E_dsrg.imag) > 1e-12:
-            logger.log_warning(
-                f"DSRG energy has a significant imaginary component: {self.E_dsrg.imag}"
-            )
+        self.E_dsrg = self._solve_dsrg_shifted(form_hbar)
 
         self.relax_energies[0, 0] = self.E_dsrg.real
         # self.ints["E"] is <Psi_current| bare H |Psi_current>
@@ -173,21 +367,25 @@ class DSRGBase(Method):
                 break
 
             self.converged = self.test_relaxation_convergence(irelax)
-            if self.converged:
+            if self.converged or irelax == self.nrelax - 1:
+                # leaving on the last iteration too: the work below only
+                # prepares the next one, and there isn't one
                 break
 
+            # Drop the previous set first: get_integrals() does not read self.ints,
+            # so holding both across the call would double the integral footprint on
+            # every relaxation iteration. Subclasses extend this to the working
+            # tensors they hang off self, which for MRPT3 is most of the footprint
+            # and would otherwise accumulate across iterations.
+            self._release_integrals()
             self.ints, self.cumulants = self.get_integrals()
-            self.E_dsrg = self.solve_dsrg(form_hbar=form_hbar)
-            if abs(self.E_dsrg.imag) > 1e-12:
-                logger.log_warning(
-                    f"DSRG energy has a significant imaginary component: {self.E_dsrg.imag}"
-                )
+            self.E_dsrg = self._solve_dsrg_shifted(form_hbar)
             self.E = self.E_dsrg
-        else:
-            if self.nrelax > 0:
-                logger.log_warning(
-                    f"DSRG reference relaxation did not converge in {self.nrelax} iterations."
-                )
+
+        if self.nrelax > 0 and not self.converged:
+            logger.log_warning(
+                f"DSRG reference relaxation did not converge in {self.nrelax} iterations."
+            )
         if self.nrelax > 0:
             logger.log_info1("=" * width)
         logger.log_info1("\nFinal DSRG energies (a.u.):")
@@ -201,15 +399,13 @@ class DSRGBase(Method):
                     self.ci_solver.sa_info, self.ci_solver.evals_per_solver
                 )
         self.relax_eigvals_history = np.array(self.relax_eigvals_history)
+        self._post_process()
         self.executed = True
         return self
 
     def test_relaxation_convergence(self, irelax):
         if irelax == 0:
             return False
-
-        if irelax == self.nrelax - 1:
-            return True
 
         delta_fixed_ref = abs(
             self.relax_energies[irelax, 0] - self.relax_energies[irelax - 1, 0]
@@ -236,14 +432,18 @@ class DSRGBase(Method):
     @property
     def hbar0(self):
         if self._hbar0 is None:
-            raise RuntimeError("hbar0 is only available after reference relaxation!")
+            raise RuntimeError(
+                "hbar0 is only available after reference relaxation or a run "
+                "with save_hbar=True!"
+            )
         return self._hbar0
 
     @property
     def hbar1_canon(self):
         if self._hbar1_canon is None:
             raise RuntimeError(
-                "hbar1_canon is only available after reference relaxation!"
+                "hbar1_canon is only available after reference relaxation or "
+                "a run with save_hbar=True!"
             )
         return self._hbar1_canon
 
@@ -251,6 +451,7 @@ class DSRGBase(Method):
     def hbar2_canon(self):
         if self._hbar2_canon is None:
             raise RuntimeError(
-                "hbar2_canon is only available after reference relaxation!"
+                "hbar2_canon is only available after reference relaxation or "
+                "a run with save_hbar=True!"
             )
         return self._hbar2_canon
